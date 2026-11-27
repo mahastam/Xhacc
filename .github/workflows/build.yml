@@ -1,0 +1,507 @@
+name: Build APK
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/cpp app/src/main/java/com/example/xheaac
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "xHEAAC"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.xheaac"
+              compileSdk = 34
+              ndkVersion = "26.1.10909125"
+              defaultConfig {
+                  applicationId = "com.example.xheaac"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+              }
+              externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.appcompat:appcompat:1.7.0") }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="xHE-AAC Encoder" android:theme="@style/Theme.AppCompat.DayNight">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(xaacjni C)
+          set(XAAC ${CMAKE_SOURCE_DIR}/../../../../third_party/libxaac)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          if(ANDROID_ABI STREQUAL "arm64-v8a")
+            set(BUILD64 ON CACHE BOOL "" FORCE)
+          endif()
+          add_subdirectory(${XAAC} ${CMAKE_BINARY_DIR}/libxaac EXCLUDE_FROM_ALL)
+          if(NOT TARGET libxaacenc)
+            message(FATAL_ERROR "libxaacenc target not found in libxaac CMake")
+          endif()
+          target_compile_options(libxaacenc PRIVATE -Wno-error)
+          set_target_properties(libxaacenc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+          add_library(xaacjni SHARED xaac_jni.c)
+          target_include_directories(xaacjni PRIVATE
+              ${XAAC}/encoder ${XAAC}/encoder/drc_src ${XAAC}/common ${XAAC}/test/encoder)
+          target_link_libraries(xaacjni libxaacenc log m)
+          EOF
+
+          cat > app/src/main/cpp/xaac_jni.c <<'EOF'
+          #include <jni.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <android/log.h>
+          #include "ixheaac_type_def.h"
+          #include "impd_drc_common_enc.h"
+          #include "impd_drc_uni_drc.h"
+          #include "impd_drc_tables.h"
+          #include "impd_drc_api.h"
+          #include "impd_drc_user_config.h"
+          #include "iusace_cnst.h"
+          #include "ixheaace_api.h"
+          #include "ixheaac_error_standards.h"
+          #include "ixheaace_error_handler.h"
+          #include "ixheaace_loudness_measurement.h"
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_ERROR, "xaac", __VA_ARGS__)
+
+          typedef struct {
+              ixheaace_input_config in;
+              ixheaace_output_config out;
+              unsigned char *asc;
+              int asc_len;
+          } Enc;
+
+          static pVOID x_malloc(UWORD32 size, UWORD32 alignment) {
+              pVOID ptr = NULL;
+              if (posix_memalign((void **)&ptr, alignment, size)) ptr = NULL;
+              return ptr;
+          }
+          static VOID x_free(pVOID ptr) { free(ptr); }
+
+          /* Same two-pass loudness measurement as the official libxaac testbench. */
+          static int measure_loudness(ixheaace_input_config *in, ixheaace_output_config *out, const char *path) {
+              FILE *f = fopen(path, "rb");
+              if (!f) return -1;
+              WORD32 ch = in->i_channels;
+              VOID *h = x_malloc(ixheaace_loudness_info_get_handle_size(), DEFAULT_MEM_ALIGN_8);
+              if (!h) { fclose(f); return -1; }
+              if (ixheaace_loudness_init_params(h, in, out)) { x_free(h); fclose(f); return -1; }
+              WORD32 per100 = out->samp_freq / 10;
+              if (per100 < 1) per100 = 1;
+              WORD16 **samples = (WORD16 **)calloc(ch, sizeof(*samples));
+              for (WORD32 c = 0; c < ch; c++) samples[c] = (WORD16 *)calloc(per100, sizeof(WORD16));
+              WORD32 in_samples = (WORD32)((in->i_samp_freq / 10) * ch);
+              WORD16 *tmp = (WORD16 *)calloc(in_samples > 0 ? in_samples : 1, sizeof(WORD16));
+              WORD32 nspf = (WORD32)(out->samp_freq * 0.1 * ch);
+              WORD32 count = 0;
+              while (count <= ((in->aac_config.length / 2) - nspf)) {
+                  size_t got = fread(tmp, sizeof(WORD16), in_samples, f);
+                  if ((WORD32)got < in_samples) memset(tmp + got, 0, (in_samples - got) * sizeof(WORD16));
+                  for (WORD32 i = 0; i < in_samples; i++) {
+                      if (i / ch < per100) samples[i % ch][i / ch] = tmp[i];
+                  }
+                  in->measured_loudness = ixheaace_measure_loudness(h, samples);
+                  count += nspf;
+                  if (nspf <= 0) break;
+              }
+              if (in->method_def == METHOD_DEFINITION_PROGRAM_LOUDNESS) {
+                  in->measured_loudness = ixheaace_measure_integrated_loudness(h);
+                  in->sample_peak_level = ixheaace_measure_sample_peak_value(h);
+              }
+              for (WORD32 c = 0; c < ch; c++) free(samples[c]);
+              free(samples); free(tmp); x_free(h); fclose(f);
+              return 0;
+          }
+
+          JNIEXPORT jlong JNICALL Java_com_example_xheaac_Native_create(
+                  JNIEnv *env, jobject thiz, jint sr, jint ch, jint bitrate, jstring jpath, jlong total) {
+              Enc *e = (Enc *)calloc(1, sizeof(Enc));
+              if (!e) return -1;
+              ixheaace_input_config *in = &e->in;
+              ixheaace_output_config *out = &e->out;
+              in->pv_drc_cfg = calloc(1, sizeof(ia_drc_input_config));
+              if (!in->pv_drc_cfg) { free(e); return -1; }
+              out->malloc_xheaace = &x_malloc;
+              out->free_xheaace = &x_free;
+
+              /* defaults, copied from the official testbench (USAC path) */
+              memset(&in->aac_config, 0, sizeof(in->aac_config));
+              in->aac_config.bitrate = 48000;
+              in->aac_config.bandwidth = 0;
+              in->aac_config.inv_quant = 2;
+              in->aac_config.use_tns = 1;
+              in->aac_config.noise_filling = 0;
+              in->aac_config.bitreservoir_size = 768;
+              in->aac_config.full_bandwidth = 0;
+              in->aac_config.length = (WORD32)(total > 0x7fffffffLL ? 0x7fffffff : total);
+
+              in->i_bitrate = bitrate;
+              in->aot = AOT_USAC;
+              in->usac_en = 1;
+              in->codec_mode = USAC_ONLY_FD;
+              in->i_channels = ch;
+              in->i_samp_freq = sr;
+              in->ui_pcm_wd_sz = 16;
+              in->i_use_mps = 0;
+              in->i_mps_tree_config = -1;
+              in->i_use_adts = 0;
+              in->i_use_es = 1;
+              in->esbr_flag = 1;
+              in->user_esbr_flag = 0;
+              in->user_tns_flag = 0;
+              in->cplx_pred = 0;
+              in->ccfl_idx = NO_SBR_CCFL_1024;
+              in->pvc_active = 0;
+              in->harmonic_sbr = 0;
+              in->inter_tes_active = 0;
+              in->use_drc_element = 0;
+              in->i_channels_mask = 0;
+              in->i_num_coupling_chan = 0;
+              in->frame_cmd_flag = 0;
+              in->out_bytes_flag = 0;
+              in->random_access_interval = DEFAULT_RAP_INTERVAL_IN_MS;
+              in->method_def = METHOD_DEFINITION_PROGRAM_LOUDNESS;
+              in->measurement_system = MEASUREMENT_SYSTEM_BS_1770_3;
+              in->use_delay_adjustment = USAC_DEFAULT_DELAY_ADJUSTMENT_VALUE;
+
+              const char *path = (*env)->GetStringUTFChars(env, jpath, NULL);
+              int lr = measure_loudness(in, out, path);
+              (*env)->ReleaseStringUTFChars(env, jpath, path);
+              if (lr != 0) { LOG("loudness measurement failed"); free(in->pv_drc_cfg); free(e); return -2; }
+
+              IA_ERRORCODE err = ixheaace_create((pVOID)in, (pVOID)out);
+              if (err != 0) {
+                  LOG("create failed 0x%x", (unsigned)err);
+                  free(in->pv_drc_cfg); free(e);
+                  return -(jlong)(err & 0x7fffffff) - 10;
+              }
+              unsigned char *ob = (unsigned char *)out->mem_info_table[IA_MEMTYPE_OUTPUT].mem_ptr;
+              e->asc_len = out->i_out_bytes;
+              e->asc = (unsigned char *)malloc(e->asc_len > 0 ? e->asc_len : 1);
+              if (e->asc_len > 0) memcpy(e->asc, ob, e->asc_len);
+              return (jlong)(intptr_t)e;
+          }
+
+          JNIEXPORT jint JNICALL Java_com_example_xheaac_Native_inputSize(JNIEnv *env, jobject thiz, jlong h) {
+              return ((Enc *)(intptr_t)h)->out.input_size;
+          }
+
+          JNIEXPORT jint JNICALL Java_com_example_xheaac_Native_expectedFrames(JNIEnv *env, jobject thiz, jlong h) {
+              return ((Enc *)(intptr_t)h)->out.expected_frame_count;
+          }
+
+          JNIEXPORT jbyteArray JNICALL Java_com_example_xheaac_Native_config(JNIEnv *env, jobject thiz, jlong h) {
+              Enc *e = (Enc *)(intptr_t)h;
+              jbyteArray a = (*env)->NewByteArray(env, e->asc_len);
+              (*env)->SetByteArrayRegion(env, a, 0, e->asc_len, (const jbyte *)e->asc);
+              return a;
+          }
+
+          /* returns null on error, empty array when the encoder produced no output yet */
+          JNIEXPORT jbyteArray JNICALL Java_com_example_xheaac_Native_encode(
+                  JNIEnv *env, jobject thiz, jlong h, jbyteArray data, jint len) {
+              Enc *e = (Enc *)(intptr_t)h;
+              unsigned char *ib = (unsigned char *)e->out.mem_info_table[IA_MEMTYPE_INPUT].mem_ptr;
+              jint isz = e->out.input_size;
+              memset(ib, 0, isz);
+              if (data && len > 0) {
+                  if (len > isz) len = isz;
+                  (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)ib);
+              }
+              IA_ERRORCODE err = ixheaace_process(e->out.pv_ia_process_api_obj, &e->in, &e->out);
+              if (err & IA_FATAL_ERROR) { LOG("process failed 0x%x", (unsigned)err); return NULL; }
+              int n = e->out.i_out_bytes;
+              jbyteArray a = (*env)->NewByteArray(env, n > 0 ? n : 0);
+              if (n > 0) {
+                  (*env)->SetByteArrayRegion(env, a, 0, n,
+                      (const jbyte *)e->out.mem_info_table[IA_MEMTYPE_OUTPUT].mem_ptr);
+              }
+              return a;
+          }
+
+          JNIEXPORT void JNICALL Java_com_example_xheaac_Native_close(JNIEnv *env, jobject thiz, jlong h) {
+              Enc *e = (Enc *)(intptr_t)h;
+              if (!e) return;
+              ixheaace_delete((pVOID)&e->out);
+              free(e->in.pv_drc_cfg);
+              free(e->asc);
+              free(e);
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/xheaac/Native.kt <<'EOF'
+          package com.example.xheaac
+          object Native {
+              init { System.loadLibrary("xaacjni") }
+              external fun create(sampleRate: Int, channels: Int, bitrate: Int, pcmPath: String, totalBytes: Long): Long
+              external fun inputSize(h: Long): Int
+              external fun expectedFrames(h: Long): Int
+              external fun config(h: Long): ByteArray
+              external fun encode(h: Long, data: ByteArray?, len: Int): ByteArray?
+              external fun close(h: Long)
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/xheaac/Converter.kt <<'EOF'
+          package com.example.xheaac
+          import android.content.Context
+          import android.media.*
+          import android.net.Uri
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+
+          object Converter {
+              fun convert(ctx: Context, input: Uri, out: File, bitrate: Int, onProgress: (Int) -> Unit) {
+                  val pcm = File(ctx.cacheDir, "in.pcm")
+                  try {
+                      val (sr, ch) = decodeToPcm(ctx, input, pcm) { onProgress(it / 2) }
+                      encode(pcm, sr, ch, bitrate, out) { onProgress(50 + it / 2) }
+                  } finally { pcm.delete() }
+                  onProgress(100)
+              }
+
+              private fun decodeToPcm(ctx: Context, input: Uri, pcm: File, progress: (Int) -> Unit): Pair<Int, Int> {
+                  val ex = MediaExtractor().apply { setDataSource(ctx, input, null) }
+                  try {
+                      val ti = (0 until ex.trackCount).first {
+                          ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME)!!.startsWith("audio/")
+                      }
+                      ex.selectTrack(ti)
+                      val inFmt = ex.getTrackFormat(ti)
+                      val durUs = if (inFmt.containsKey(MediaFormat.KEY_DURATION)) inFmt.getLong(MediaFormat.KEY_DURATION) else 0L
+                      val dec = MediaCodec.createDecoderByType(inFmt.getString(MediaFormat.KEY_MIME)!!)
+                      dec.configure(inFmt, null, null, 0); dec.start()
+                      var sr = inFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                      var ch = inFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                      var isFloat = false
+                      val info = MediaCodec.BufferInfo()
+                      var inDone = false; var outDone = false
+                      BufferedOutputStream(FileOutputStream(pcm), 1 shl 16).use { os ->
+                          while (!outDone) {
+                              if (!inDone) {
+                                  val i = dec.dequeueInputBuffer(10_000)
+                                  if (i >= 0) {
+                                      val n = ex.readSampleData(dec.getInputBuffer(i)!!, 0)
+                                      if (n < 0) { dec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); inDone = true }
+                                      else { dec.queueInputBuffer(i, 0, n, ex.sampleTime, 0); ex.advance() }
+                                  }
+                              }
+                              val o = dec.dequeueOutputBuffer(info, 10_000)
+                              if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                                  val f = dec.outputFormat
+                                  sr = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                                  ch = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                                  isFloat = f.containsKey(MediaFormat.KEY_PCM_ENCODING) &&
+                                      f.getInteger(MediaFormat.KEY_PCM_ENCODING) == AudioFormat.ENCODING_PCM_FLOAT
+                              } else if (o >= 0) {
+                                  if (info.size > 0) {
+                                      val bb = dec.getOutputBuffer(o)!!
+                                      bb.position(info.offset); bb.limit(info.offset + info.size)
+                                      bb.order(ByteOrder.LITTLE_ENDIAN)
+                                      if (isFloat) {
+                                          val fb = bb.asFloatBuffer()
+                                          val n = fb.remaining()
+                                          val arr = ByteArray(n * 2)
+                                          for (k in 0 until n) {
+                                              val v = (fb.get() * 32767f).toInt().coerceIn(-32768, 32767)
+                                              arr[2 * k] = v.toByte(); arr[2 * k + 1] = (v shr 8).toByte()
+                                          }
+                                          os.write(arr)
+                                      } else {
+                                          val arr = ByteArray(info.size)
+                                          bb.get(arr)
+                                          os.write(arr)
+                                      }
+                                  }
+                                  if (durUs > 0) progress((info.presentationTimeUs * 100 / durUs).toInt().coerceIn(0, 100))
+                                  dec.releaseOutputBuffer(o, false)
+                                  if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outDone = true
+                              }
+                          }
+                      }
+                      dec.stop(); dec.release()
+                      return Pair(sr, ch)
+                  } finally { ex.release() }
+              }
+
+              private fun encode(pcm: File, sr: Int, ch: Int, bitrate: Int, out: File, progress: (Int) -> Unit) {
+                  require(ch in 1..2) { "Only mono/stereo supported (channels=$ch)" }
+                  val total = pcm.length()
+                  require(total > 0) { "Decoded audio is empty" }
+                  val enc = Native.create(sr, ch, bitrate, pcm.absolutePath, total)
+                  check(enc > 0L) { "xHE-AAC init failed, code=$enc" }
+                  var mx: MediaMuxer? = null
+                  try {
+                      val inSize = Native.inputSize(enc)
+                      val expected = Native.expectedFrames(enc)
+                      val frameSamples = inSize / (2 * ch)
+                      val fmt = MediaFormat.createAudioFormat("audio/mp4a-latm", sr, ch)
+                      fmt.setByteBuffer("csd-0", ByteBuffer.wrap(Native.config(enc)))
+                      val m = MediaMuxer(out.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                      mx = m
+                      val track = m.addTrack(fmt); m.start()
+                      var produced = 0L
+                      val bi = MediaCodec.BufferInfo()
+                      fun emit(b: ByteArray?) {
+                          check(b != null) { "Encoding failed" }
+                          if (b.isEmpty()) return
+                          bi.set(0, b.size, produced * frameSamples * 1_000_000L / sr, 0)
+                          m.writeSampleData(track, ByteBuffer.wrap(b), bi)
+                          produced++
+                      }
+                      FileInputStream(pcm).use { fis ->
+                          val chunk = ByteArray(inSize)
+                          var read = 0L
+                          fun fill(): Int {
+                              var n = 0
+                              while (n < inSize) {
+                                  val r = fis.read(chunk, n, inSize - n)
+                                  if (r < 0) break
+                                  n += r
+                              }
+                              return n
+                          }
+                          var n = fill()
+                          while (n > 0) {
+                              emit(Native.encode(enc, chunk, n))
+                              read += n
+                              progress((read * 100 / total).toInt().coerceIn(0, 100))
+                              n = fill()
+                              if (expected > 0 && produced >= expected) break
+                          }
+                      }
+                      var extra = 0
+                      while (expected > 0 && produced < expected && extra < 8) {
+                          emit(Native.encode(enc, null, 0)); extra++
+                      }
+                      check(produced > 0) { "Encoder produced no frames" }
+                  } finally {
+                      try { mx?.stop() } catch (_: Throwable) {}
+                      try { mx?.release() } catch (_: Throwable) {}
+                      Native.close(enc)
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/xheaac/MainActivity.kt <<'EOF'
+          package com.example.xheaac
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          class MainActivity : AppCompatActivity() {
+              private var input: Uri? = null
+              private lateinit var status: TextView
+              private lateinit var kbps: EditText
+              private lateinit var pb: ProgressBar
+              private val tmp by lazy { File(cacheDir, "out.m4a") }
+
+              private val pick = registerForActivityResult(ActivityResultContracts.OpenDocument()) { u ->
+                  input = u; status.text = u?.lastPathSegment ?: "No file selected"
+              }
+              private val save = registerForActivityResult(ActivityResultContracts.CreateDocument("audio/mp4")) { dest ->
+                  if (dest != null) run(dest)
+              }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  status = TextView(this).apply { text = "No file selected" }
+                  kbps = EditText(this).apply { setText("64"); hint = "Bitrate (kbps)" }
+                  val b1 = Button(this).apply { text = "Pick audio file"; setOnClickListener { pick.launch(arrayOf("audio/*")) } }
+                  val b2 = Button(this).apply { text = "Convert to xHE-AAC"; setOnClickListener {
+                      if (input == null) status.text = "Pick a file first" else save.launch("output.m4a") } }
+                  pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
+                  listOf(status, kbps, b1, b2, pb).forEach { root.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, -2)) }
+                  setContentView(root)
+              }
+
+              private fun run(dest: Uri) {
+                  val br = (kbps.text.toString().toIntOrNull() ?: 64) * 1000
+                  runOnUiThread { status.text = "Converting..." }
+                  thread {
+                      try {
+                          Converter.convert(this, input!!, tmp, br) { p -> runOnUiThread { pb.progress = p } }
+                          contentResolver.openOutputStream(dest)!!.use { o -> tmp.inputStream().use { it.copyTo(o) } }
+                          runOnUiThread { status.text = "Done" }
+                      } catch (e: Throwable) { runOnUiThread { status.text = "Error: ${e.message}" } }
+                  }
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install NDK + CMake
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+
+      - name: Fetch libxaac
+        run: git clone --depth 1 https://github.com/ittiam-systems/libxaac third_party/libxaac
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
+
+      - run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xheaac-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
